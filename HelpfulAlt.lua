@@ -1,7 +1,9 @@
 --[[
     HelpfulAlt — Autonomous support addon for a secondary FFXI account.
-    Milestone 1: BRD song upkeep. Monitors self-buffs and re-casts up to
-    two configured songs whenever they fall off.
+    Milestone 2: Cast tracking via action packets (0x028). Spells are
+    sequenced by actual completion/interruption events rather than a timed
+    delay, fixing the two-song initial-cast bug and eliminating coroutine
+    errors from XML-string config values.
 
     Commands:
         //ha on                     — enable automation
@@ -12,7 +14,7 @@
 ]]
 
 _addon.name     = 'HelpfulAlt'
-_addon.version  = '1.0.1'
+_addon.version  = '2.0.0'
 _addon.author   = 'User'
 _addon.commands = {'helpfulalt', 'ha'}
 
@@ -28,29 +30,29 @@ local defaults = {
     song1         = 'Blade Madrigal',
     song2         = 'Victory March',
     song_count    = 2,
-    -- Seconds to wait between casting consecutive songs.
-    -- BRD song cast time is ~2.5s; 4.5s gives a comfortable buffer.
-    cast_delay    = 4.5,
-    -- Re-cast songs this many seconds before they expire (songs last ~2 min).
+    -- Re-cast a song after this many seconds if no buff ID is available.
     song_duration = 110,
 }
 
 -- ─────────────────────────────────────────────────────────
 -- Runtime state
 -- ─────────────────────────────────────────────────────────
-local settings        -- loaded config
-local song_lookup  = {}  -- [spell_name] = {spell_id=N, buff_id=N}
-local active_songs = {}  -- [buff_id] = true  (only tracked song buff IDs)
-local last_cast    = {}  -- [spell_name] = os.time() of most recent cast attempt
-local casting         = false  -- true while a cast-sequence coroutine is running
+local settings            -- loaded config
+local song_lookup  = {}   -- [spell_name] = {spell_id=N, buff_id=N}
+local active_songs = {}   -- [buff_id] = true  (only tracked song buff IDs)
+local last_cast    = {}   -- [spell_name] = os.time() of most recent cast attempt
+local casting         = false  -- true while a /ma has been issued and not yet resolved
 local cast_started_at = 0      -- os.time() when casting was last set to true
-local poll_tick       = 0      -- prerender counter for periodic safety-net check
+local poll_tick       = 0      -- prerender counter for periodic checks
 
 -- Player status constants
 local STATUS_IDLE     = 0
 local STATUS_ENGAGED  = 1
 local STATUS_DEAD     = 3
 local STATUS_ZONING   = 4
+
+-- Minimum seconds before retrying after a /ma is issued (handles interruptions).
+local MIN_RECAST_WAIT = 10
 
 -- ─────────────────────────────────────────────────────────
 -- Helpers
@@ -70,11 +72,16 @@ local function is_safe_to_cast()
     return s == STATUS_IDLE or s == STATUS_ENGAGED
 end
 
+-- Coerce numeric settings after config.load (XML may load them as strings).
+local function coerce_settings()
+    settings.song_count    = tonumber(settings.song_count)    or defaults.song_count
+    settings.song_duration = tonumber(settings.song_duration) or defaults.song_duration
+end
+
 -- ─────────────────────────────────────────────────────────
 -- Spell resource lookup
 -- ─────────────────────────────────────────────────────────
 
--- Scan res.spells once at startup and build song_lookup.
 local function build_song_lookup()
     song_lookup = {}
     for id, spell in pairs(res.spells) do
@@ -120,8 +127,7 @@ local function build_buff_map()
 end
 
 -- Sync active_songs from the player's live buff list.
--- BUG FIX: only store buff IDs that belong to configured songs,
--- preventing false positives from unrelated buffs sharing the same ID.
+-- Only stores buff IDs that belong to configured songs.
 local function sync_active_songs()
     active_songs = {}
     local p = windower.ffxi.get_player()
@@ -134,22 +140,13 @@ local function sync_active_songs()
     end
 end
 
--- Seconds to wait after issuing a /ma before retrying.
--- Covers cast time (~2.5s) + gain buff event delay + interruption lockout.
-local MIN_RECAST_WAIT = 10
-
 -- Determine whether a song slot currently needs to be cast.
--- Two strategies depending on whether we know the buff_id:
---   buff_id known  → check active_songs (event-driven)
---   buff_id absent → check last_cast time (time-based fallback)
--- Either way: never retry within MIN_RECAST_WAIT seconds of the last attempt,
--- which prevents spamming "Unable to cast" after an interrupted cast.
 local function slot_needs_cast(i)
     local name = slot_name(i)
     if not name or name == '' then return false end
 
     local spell_id, buff_id = get_song_data(name)
-    if not spell_id then return false end  -- song name not in resources
+    if not spell_id then return false end  -- spell name not in resources
 
     -- Cooldown: don't retry too soon after the last cast attempt
     local t = last_cast[name]
@@ -168,75 +165,92 @@ end
 -- Cast logic
 -- ─────────────────────────────────────────────────────────
 
--- Wait for recast to clear, then cast the song.  Must run in a coroutine.
-local function cast_song(name, spell_id)
-    while true do
-        if not settings.enabled or not is_safe_to_cast() then
-            return false
-        end
-        local ticks = windower.ffxi.get_spell_recasts()[spell_id] or 0
-        if ticks == 0 then break end
-        local secs = math.ceil(ticks / 60)
-        log(('Waiting %ds for %s recast...'):format(secs, name))
-        coroutine.sleep(math.min(secs, 5))
-    end
-
-    if not settings.enabled or not is_safe_to_cast() then
-        return false
-    end
-
-    log('Casting ' .. name)
-    windower.chat.input('/ma "' .. name .. '" <me>')
-    last_cast[name] = os.time()
-    return true
-end
-
--- Scan all slots and cast anything missing, in priority order.
+-- Scan all slots and cast the first missing, ready song.
+-- Issues only ONE /ma at a time. The action packet handler (below) calls
+-- this again after each spell completes to continue the sequence.
 local function upkeep_songs()
     if not settings or not settings.enabled then return end
     if casting then return end
     if not is_safe_to_cast() then return end
 
-    -- Quick scan: is any slot missing?
-    local any_missing = false
     for i = 1, settings.song_count do
         if slot_needs_cast(i) then
-            any_missing = true
-            break
+            local name     = slot_name(i)
+            local spell_id = get_song_data(name)
+
+            -- If the spell is still on recast, skip to the next slot.
+            -- The prerender quick-check will retry when it clears.
+            local ticks = windower.ffxi.get_spell_recasts()[spell_id] or 0
+            if ticks == 0 then
+                log('Casting ' .. name)
+                windower.chat.input('/ma "' .. name .. '" <me>')
+                last_cast[name]  = os.time()
+                casting          = true
+                cast_started_at  = os.time()
+                return  -- One cast at a time; action packet drives the next
+            end
         end
     end
-    if not any_missing then return end
+end
 
-    casting         = true
-    cast_started_at = os.time()
+-- ─────────────────────────────────────────────────────────
+-- Action packet handler (incoming 0x028)
+--
+-- Category 4 (spell finish): act.param = spell_id
+-- Category 8 (cast begin/interrupt): act.param = 24931 (start) or
+--   28787 (interrupt); act.targets[1].actions[1].param = spell_id
+-- ─────────────────────────────────────────────────────────
 
-    coroutine.wrap(function()
-        local first_cast = true
+windower.register_event('incoming chunk', function(id, data)
+    if id ~= 0x028 then return end
+    if not settings or not settings.enabled then return end
 
-        for i = 1, settings.song_count do
-            if slot_needs_cast(i) then
-                local name     = slot_name(i)
-                local spell_id = get_song_data(name)
+    local act = windower.packets.parse_action(data)
+    local p   = windower.ffxi.get_player()
+    if not p or act.actor_id ~= p.id then return end
 
-                if not first_cast then
-                    coroutine.sleep(settings.cast_delay)
-                    if not settings.enabled or not is_safe_to_cast() then
+    -- Category 8: spell cast initiated or interrupted
+    if act.category == 8 then
+        if act.param == 28787 then
+            -- Our cast was interrupted. Clear the flag and schedule a retry
+            -- after MIN_RECAST_WAIT so we don't immediately hit the lockout.
+            casting = false
+            log('Cast interrupted. Will retry in ' .. MIN_RECAST_WAIT .. 's.')
+            coroutine.wrap(function()
+                coroutine.sleep(MIN_RECAST_WAIT + 2)
+                upkeep_songs()
+            end)()
+        end
+        -- param == 24931 means the cast started; casting flag stays true.
+
+    -- Category 4: spell cast completed
+    elseif act.category == 4 then
+        -- Any spell completion from us while casting = true means our cast
+        -- finished. Update active_songs immediately (gain buff fires shortly
+        -- after, but this keeps state tight).
+        if casting then
+            local completed_spell_id = act.param
+            for i = 1, settings.song_count do
+                local name = slot_name(i)
+                if name then
+                    local sid, bid = get_song_data(name)
+                    if sid == completed_spell_id and bid and bid ~= 0 then
+                        if act.targets and act.targets[1] and act.targets[1].id == p.id then
+                            active_songs[bid] = true
+                        end
                         break
                     end
                 end
-
-                local cast_ok = cast_song(name, spell_id)
-                if cast_ok then
-                    first_cast = false
-                else
-                    break
-                end
             end
+            casting = false
+            -- Brief pause, then check whether more songs still need casting.
+            coroutine.wrap(function()
+                coroutine.sleep(1)
+                upkeep_songs()
+            end)()
         end
-
-        casting = false
-    end)()
-end
+    end
+end)
 
 -- ─────────────────────────────────────────────────────────
 -- Events
@@ -244,6 +258,7 @@ end
 
 windower.register_event('load', function()
     settings = config.load(defaults)
+    coerce_settings()
     build_song_lookup()
     sync_active_songs()
     log(('Loaded v%s. Enabled: %s | %s / %s'):format(
@@ -318,19 +333,27 @@ windower.register_event('status change', function(new_status)
     end
 end)
 
--- Periodic safety-net: re-check every ~60s regardless of events.
--- Also resets a stuck casting flag if a coroutine died without clearing it.
+-- Periodic checks via prerender:
+--   Every ~5s  — quick upkeep (catches spells waiting on recast to clear).
+--   Every ~60s — full sync (catches any missed buff events).
+--   Also resets a stuck casting flag if it's been true for over 30 seconds.
 windower.register_event('prerender', function()
     if not settings or not settings.enabled then return end
     poll_tick = poll_tick + 1
-    if poll_tick >= 3600 then  -- 3600 frames ≈ 60s at 60fps
+
+    if poll_tick >= 3600 then  -- ~60s at 60 fps
         poll_tick = 0
-        -- Unstick the casting flag if a coroutine error left it true
         if casting and (os.time() - cast_started_at) > 60 then
-            log('Cast sequence timed out — resetting.')
+            log('Cast timed out — resetting.')
             casting = false
         end
         sync_active_songs()
+        upkeep_songs()
+    elseif poll_tick % 300 == 0 then  -- ~5s
+        if casting and (os.time() - cast_started_at) > 30 then
+            log('Cast timed out — resetting.')
+            casting = false
+        end
         upkeep_songs()
     end
 end)

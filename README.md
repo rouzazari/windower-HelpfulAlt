@@ -2,7 +2,7 @@
 
 > A Windower 4 addon that autonomously controls a secondary FFXI account playing a healer or support role. Designed to keep your alt running hands-free while you focus on your main character.
 
-**Version:** 1.0.1
+**Version:** 2.0.0
 **Command:** `//ha` or `//helpfulalt`
 
 ---
@@ -87,8 +87,7 @@ Settings are saved automatically to `data/settings.xml` on first load. You can e
 | `enabled` | `true` | Whether automation is active on load |
 | `song1` | `Blade Madrigal` | Song in slot 1 (highest priority) |
 | `song2` | `Victory March` | Song in slot 2 |
-| `song_count` | `2` | Number of song slots to manage (1–2 in Milestone 1) |
-| `cast_delay` | `4.5` | Seconds to wait between consecutive song casts |
+| `song_count` | `2` | Number of song slots to manage (1–2) |
 | `song_duration` | `110` | Seconds before re-casting a song with no buff ID tracking |
 
 ---
@@ -102,15 +101,15 @@ Each configured song is monitored using two complementary strategies:
 - **Buff ID tracking (preferred):** The addon looks up the buff ID that the spell applies from Windower's spell resources. When a `gain buff` event fires with that ID, the song is marked active. When a `lose buff` event fires, the addon immediately attempts to re-cast.
 - **Time-based fallback:** For songs where no buff ID is available in resources, the addon records the time of the last cast and re-casts after `song_duration` seconds.
 
-A periodic safety-net check runs every ~60 seconds regardless of events, catching any missed buff events or edge cases.
+A quick safety-net check runs every ~5 seconds (for recast polling) and a full buff sync runs every ~60 seconds, catching any missed events or edge cases.
 
 ### Cast sequencing
 
-When one or more songs are missing, a coroutine casts them in slot priority order (slot 1 first). A `cast_delay` pause between consecutive casts prevents packet flooding. If a spell is on recast, the addon polls until it becomes available before casting.
+When one or more songs are missing, the addon issues one `/ma` command at a time in slot priority order (slot 1 first). After each spell completes, an incoming action packet (category 4) triggers the next cast automatically. If a spell is on recast, that slot is skipped and the next slot is attempted; the periodic check resumes the skipped slot once the recast clears.
 
 ### Interruption handling
 
-After issuing a `/ma` command, the addon waits at least 10 seconds before retrying that song. This prevents the "Unable to cast spells at this time" error that occurs when a cast is interrupted and the game has a brief recovery lockout.
+The addon listens for action packet category 8 with param `28787` (cast interrupted). When detected, the `casting` lock is cleared and a retry is scheduled after 10 seconds, avoiding the "Unable to cast spells at this time" lockout. A `last_cast` timestamp on each `/ma` also enforces a minimum 10-second window before any retry.
 
 ### Safety checks
 
@@ -120,13 +119,11 @@ The addon will not cast while the player is dead or zoning. It resumes automatic
 
 ## Roadmap
 
-### ✅ Milestone 1 — BRD 2-Song Upkeep *(current)*
+### ✅ Milestone 1 — BRD 2-Song Upkeep
 Autonomous maintenance of two configurable songs. Reactive buff tracking with time-based fallback, interruption handling, and a periodic safety-net.
 
-### Milestone 2 — Robustness & Extended Song Configuration
-- Runtime song slot changes with full validation
-- Improved interruption detection via action packets
-- `//ha song` support for all slots
+### ✅ Milestone 2 — Robustness & Action-Packet Sequencing *(current)*
+Cast sequencing driven by incoming action packets instead of a timed delay. Interruption detection via packet category. Faster recast polling. Fixed numeric config coercion bug that prevented the second song from casting.
 
 ### Milestone 3 — 3 and 4 Song Support
 - Expand `song_count` to support up to 4 slots
@@ -154,6 +151,14 @@ Autonomous maintenance of two configurable songs. Reactive buff tracking with ti
 
 ## Change Log
 
+### 2.0.0
+- Reworked: Cast sequencing now driven by incoming action packets (0x028) instead of a fixed `cast_delay` timer, eliminating the coroutine-based inter-song pause
+- Fixed: Second song now reliably casts when both songs are missing — root cause was `cast_delay` loaded as a string from XML, causing a silent coroutine error that left the `casting` flag stuck
+- Added: `incoming chunk` handler detects spell completion (category 4) and interruption (category 8, param 28787) and drives the next cast automatically
+- Added: `coerce_settings()` applies `tonumber()` to all numeric config values after load
+- Added: Quick upkeep check every ~5 seconds via `prerender` for faster recast polling (was ~60 seconds)
+- Removed: `cast_delay` setting (no longer needed)
+
 ### 1.0.1
 - Fixed: `sync_active_songs` now only tracks configured song buff IDs, preventing false positives from unrelated buffs sharing the same numeric ID
 - Fixed: Songs with no buff ID in resources now use time-based tracking instead of being silently skipped
@@ -169,7 +174,6 @@ Autonomous maintenance of two configurable songs. Reactive buff tracking with ti
 
 ## Known Issues
 
-- **Two-song initial cast fails silently** — When both songs are missing at the same time (e.g. fresh `//ha on`), the second song may not be cast. Workaround: after the first song is cast, run `//ha off` then `//ha on` to trigger the second. Once both songs are up, reactive re-casting works correctly. Root cause under investigation.
 - Song names must be spelled and capitalised exactly as they appear in-game (e.g. `Blade Madrigal`, not `blade madrigal`). Use `//ha status` to verify a song was found in resources.
-- If the BRD is silenced, the addon will continuously attempt to cast and poll recasts until silence is removed. Silence detection will be addressed in a future milestone.
+- If the BRD is silenced, the addon will continuously attempt to cast until silence is removed. Silence detection will be addressed in a future milestone.
 - `song_count` must currently be set by editing `data/settings.xml` directly. A runtime command will be added in Milestone 3.
