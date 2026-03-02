@@ -169,6 +169,7 @@ Autonomous maintenance of two configurable songs. Reactive buff tracking with ti
 
 ## Known Issues
 
+- **Two-song initial cast fails silently** — When both songs are missing at the same time (e.g. fresh `//ha on`), the second song may not be cast. Workaround: after the first song is cast, run `//ha off` then `//ha on` to trigger the second. Once both songs are up, reactive re-casting works correctly. Root cause under investigation.
 - Song names must be spelled and capitalised exactly as they appear in-game (e.g. `Blade Madrigal`, not `blade madrigal`). Use `//ha status` to verify a song was found in resources.
 - If the BRD is silenced, the addon will continuously attempt to cast and poll recasts until silence is removed. Silence detection will be addressed in a future milestone.
 - `song_count` must currently be set by editing `data/settings.xml` directly. A runtime command will be added in Milestone 3.
