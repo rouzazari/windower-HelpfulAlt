@@ -2,7 +2,7 @@
 
 > A Windower 4 addon that autonomously controls a secondary FFXI account playing a healer or support role. Designed to keep your alt running hands-free while you focus on your main character.
 
-**Version:** 2.0.0
+**Version:** 3.0.0
 **Command:** `//ha` or `//helpfulalt`
 
 ---
@@ -43,14 +43,14 @@
 
 ## Usage
 
-HelpfulAlt starts enabled by default. On load it will immediately check whether your configured songs are active and cast any that are missing.
+HelpfulAlt starts fully enabled by default. On load it will immediately check whether your configured songs are active and whether any party members need healing.
 
-Enable or disable automation at any time:
+Enable or disable all automation at any time:
 
     //ha on
     //ha off
 
-Check the current state of your songs:
+Check current state:
 
     //ha status
 
@@ -58,41 +58,68 @@ Check the current state of your songs:
 
 ## Commands
 
+### Song upkeep
+
 | Command | Description |
 |---|---|
-| `//ha on` | Enable autonomous song upkeep |
-| `//ha off` | Disable autonomous song upkeep |
-| `//ha status` | Show each song slot: active, missing, or last cast time |
-| `//ha recast` | Show the recast timer remaining for each configured song |
+| `//ha on` | Enable all automation (songs + healing) |
+| `//ha off` | Disable all automation |
+| `//ha status` | Show song states, heal settings, and cast lock |
+| `//ha recast` | Show recast timers for configured songs |
 | `//ha song <1\|2> <name>` | Change a song slot at runtime (saves to config) |
+
+### Party healing
+
+| Command | Description |
+|---|---|
+| `//ha heal on` | Enable party healing |
+| `//ha heal off` | Disable party healing |
+| `//ha threshold <1-99>` | Set HP% at which to cure (default: 80) |
+| `//ha cure <name>` | Set the cure spell to use (default: Cure IV) |
 
 ### Examples
 
     //ha song 1 Blade Madrigal
     //ha song 2 Victory March
-    //ha song 2 Advancing March
     //ha status
     //ha recast
+    //ha heal off
+    //ha threshold 75
+    //ha cure Cure V
 
-Song names are case-sensitive and must match the in-game spell name exactly.
+Song and spell names are case-sensitive and must match the in-game spell name exactly.
 
 ---
 
 ## Configuration
 
-Settings are saved automatically to `data/settings.xml` on first load. You can edit this file directly or use the `//ha song` command to update slots at runtime.
+Settings are saved automatically to `data/settings.xml` on first load. You can edit this file directly or use the runtime commands above.
+
+### Song settings
 
 | Setting | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Whether automation is active on load |
+| `enabled` | `true` | Whether song upkeep is active on load |
 | `song1` | `Blade Madrigal` | Song in slot 1 (highest priority) |
 | `song2` | `Victory March` | Song in slot 2 |
 | `song_count` | `2` | Number of song slots to manage (1–2) |
 | `song_duration` | `110` | Seconds before re-casting a song with no buff ID tracking |
 
+### Healing settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `heal_enabled` | `true` | Whether party healing is active on load |
+| `heal_threshold` | `80` | Cure a party member when their HP% falls below this value |
+| `cure_spell` | `Cure IV` | Spell used to heal party members |
+
 ---
 
 ## How It Works
+
+### Party healing
+
+Every ~1 second the addon polls `get_party()` and looks for any in-zone party member with HP% below `heal_threshold`. The member with the lowest HP% is targeted first. When a cure is needed the addon issues one `/ma` command and waits for the action packet (category 4) to confirm completion before moving on. Healing takes priority over song upkeep — if someone needs a cure, songs wait.
 
 ### Song tracking
 
@@ -105,11 +132,11 @@ A quick safety-net check runs every ~5 seconds (for recast polling) and a full b
 
 ### Cast sequencing
 
-When one or more songs are missing, the addon issues one `/ma` command at a time in slot priority order (slot 1 first). After each spell completes, an incoming action packet (category 4) triggers the next cast automatically. If a spell is on recast, that slot is skipped and the next slot is attempted; the periodic check resumes the skipped slot once the recast clears.
+Only one spell is ever in flight at a time. After each spell completes, an incoming action packet (category 4) triggers the next cast automatically — first checking for party members who need healing, then checking for missing songs. If a spell is on recast, that slot is skipped; the periodic check resumes it once the recast clears.
 
 ### Interruption handling
 
-The addon listens for action packet category 8 with param `28787` (cast interrupted). When detected, the `casting` lock is cleared and a retry is scheduled after 10 seconds, avoiding the "Unable to cast spells at this time" lockout. A `last_cast` timestamp on each `/ma` also enforces a minimum 10-second window before any retry.
+The addon listens for action packet category 8 with param `28787` (cast interrupted). When detected, the `casting` lock is cleared and a retry is scheduled after 10 seconds, avoiding the "Unable to cast spells at this time" lockout. A `last_cast` timestamp also enforces a minimum 10-second window before any retry.
 
 ### Safety checks
 
@@ -122,18 +149,16 @@ The addon will not cast while the player is dead or zoning. It resumes automatic
 ### ✅ Milestone 1 — BRD 2-Song Upkeep
 Autonomous maintenance of two configurable songs. Reactive buff tracking with time-based fallback, interruption handling, and a periodic safety-net.
 
-### ✅ Milestone 2 — Robustness & Action-Packet Sequencing *(current)*
+### ✅ Milestone 2 — Robustness & Action-Packet Sequencing
 Cast sequencing driven by incoming action packets instead of a timed delay. Interruption detection via packet category. Faster recast polling. Fixed numeric config coercion bug that prevented the second song from casting.
 
-### Milestone 3 — 3 and 4 Song Support
+### ✅ Milestone 3 — Party Healing *(current)*
+Monitor party HP% and cure members below a configurable threshold. Healing takes priority over song upkeep. Configurable cure spell and HP threshold.
+
+### Milestone 4 — 3 and 4 Song Support
 - Expand `song_count` to support up to 4 slots
 - Detect available song capacity from equipped gear/traits
 - Sequential casting order with configurable priority
-
-### Milestone 4 — Party Healing (WHM / SCH / RDM)
-- Monitor party HP% and cast Cure spells when members drop below a threshold
-- Configurable HP threshold and cure tier selection
-- Commands: `//ha heal on/off`, `//ha threshold <pct>`
 
 ### Milestone 5 — Debuff Removal
 - Detect debuffs on party members via party buff packets
@@ -150,6 +175,14 @@ Cast sequencing driven by incoming action packets instead of a timed delay. Inte
 ---
 
 ## Change Log
+
+### 3.0.0
+- Added: Party healing — polls party HP% every ~1 second and casts a configurable cure spell when any in-zone member falls below the threshold
+- Added: Healing takes priority over song upkeep; both share the same casting lock so only one spell is ever in flight
+- Added: `//ha heal on/off`, `//ha threshold <pct>`, `//ha cure <spell name>` commands
+- Added: `heal_enabled`, `heal_threshold`, `cure_spell` settings
+- Updated: `//ha status` now shows heal settings alongside song status
+- Updated: `//ha on/off` controls all automation; `//ha heal on/off` toggles healing independently
 
 ### 2.0.0
 - Reworked: Cast sequencing now driven by incoming action packets (0x028) instead of a fixed `cast_delay` timer, eliminating the coroutine-based inter-song pause
@@ -174,6 +207,7 @@ Cast sequencing driven by incoming action packets instead of a timed delay. Inte
 
 ## Known Issues
 
-- Song names must be spelled and capitalised exactly as they appear in-game (e.g. `Blade Madrigal`, not `blade madrigal`). Use `//ha status` to verify a song was found in resources.
-- If the BRD is silenced, the addon will continuously attempt to cast until silence is removed. Silence detection will be addressed in a future milestone.
-- `song_count` must currently be set by editing `data/settings.xml` directly. A runtime command will be added in Milestone 3.
+- Song and spell names must be spelled and capitalised exactly as they appear in-game (e.g. `Cure IV`, not `cure iv`). Use `//ha status` to verify a spell was found in resources.
+- If the character is silenced, the addon will continuously attempt to cast songs until silence is removed. Silence detection will be addressed in a future milestone.
+- `song_count` must currently be set by editing `data/settings.xml` directly. A runtime command will be added in a future milestone.
+- The cure spell is not automatically selected based on the current job — set it manually with `//ha cure <name>` or in `data/settings.xml`.

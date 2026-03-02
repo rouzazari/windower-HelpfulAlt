@@ -1,20 +1,22 @@
 --[[
     HelpfulAlt — Autonomous support addon for a secondary FFXI account.
-    Milestone 2: Cast tracking via action packets (0x028). Spells are
-    sequenced by actual completion/interruption events rather than a timed
-    delay, fixing the two-song initial-cast bug and eliminating coroutine
-    errors from XML-string config values.
+    Milestone 3: Party healing. Monitors party HP% and casts a configurable
+    cure spell on members below the threshold. Healing takes priority over
+    song upkeep; both share the same casting lock.
 
     Commands:
-        //ha on                     — enable automation
-        //ha off                    — disable automation
-        //ha status                 — show current song state
-        //ha song <1|2> <name>      — change a configured song slot
-        //ha recast                 — show song recast timers
+        //ha on                     — enable all automation
+        //ha off                    — disable all automation
+        //ha status                 — show songs, heal settings, and cast state
+        //ha song <1|2> <name>      — change a song slot
+        //ha recast                 — show recast timers for configured songs
+        //ha heal on|off            — toggle healing independently
+        //ha threshold <1-99>       — set HP% threshold for curing
+        //ha cure <spell name>      — set which cure spell to use
 ]]
 
 _addon.name     = 'HelpfulAlt'
-_addon.version  = '2.0.0'
+_addon.version  = '3.0.0'
 _addon.author   = 'User'
 _addon.commands = {'helpfulalt', 'ha'}
 
@@ -26,24 +28,31 @@ require('logger')
 -- Default settings (written to data/settings.xml on first load)
 -- ─────────────────────────────────────────────────────────
 local defaults = {
+    -- Song upkeep
     enabled       = true,
     song1         = 'Blade Madrigal',
     song2         = 'Victory March',
     song_count    = 2,
-    -- Re-cast a song after this many seconds if no buff ID is available.
     song_duration = 110,
+    -- Party healing
+    heal_enabled  = true,
+    heal_threshold = 80,   -- cure when party member hpp < this value
+    cure_spell    = 'Cure IV',
 }
 
 -- ─────────────────────────────────────────────────────────
 -- Runtime state
 -- ─────────────────────────────────────────────────────────
-local settings            -- loaded config
-local song_lookup  = {}   -- [spell_name] = {spell_id=N, buff_id=N}
-local active_songs = {}   -- [buff_id] = true  (only tracked song buff IDs)
-local last_cast    = {}   -- [spell_name] = os.time() of most recent cast attempt
+local settings              -- loaded config
+-- Maps every spell name → {spell_id, buff_id}; used for songs and cure spells.
+local spell_lookup = {}
+local active_songs = {}     -- [buff_id] = true  (only tracked song buff IDs)
+local last_cast    = {}     -- [spell_name] = os.time() of most recent cast attempt
 local casting         = false  -- true while a /ma has been issued and not yet resolved
 local cast_started_at = 0      -- os.time() when casting was last set to true
-local poll_tick       = 0      -- prerender counter for periodic checks
+local poll_tick       = 0      -- prerender counter for song/sync checks (~5s and ~60s)
+local heal_tick       = 0      -- prerender counter for party HP check (~1s)
+local cure_spell_id   = nil    -- resolved spell_id for the configured cure spell
 
 -- Player status constants
 local STATUS_IDLE     = 0
@@ -51,7 +60,10 @@ local STATUS_ENGAGED  = 1
 local STATUS_DEAD     = 3
 local STATUS_ZONING   = 4
 
--- Minimum seconds before retrying after a /ma is issued (handles interruptions).
+-- Party slot keys in priority order (p0 = self, p1..p5 = others).
+local PARTY_KEYS = {'p0', 'p1', 'p2', 'p3', 'p4', 'p5'}
+
+-- Minimum seconds before retrying after a /ma (covers interruption lockout).
 local MIN_RECAST_WAIT = 10
 
 -- ─────────────────────────────────────────────────────────
@@ -72,34 +84,45 @@ local function is_safe_to_cast()
     return s == STATUS_IDLE or s == STATUS_ENGAGED
 end
 
--- Coerce numeric settings after config.load (XML may load them as strings).
+-- Coerce numeric/bool settings after config.load (XML may load them as strings).
 local function coerce_settings()
-    settings.song_count    = tonumber(settings.song_count)    or defaults.song_count
-    settings.song_duration = tonumber(settings.song_duration) or defaults.song_duration
+    settings.song_count     = tonumber(settings.song_count)     or defaults.song_count
+    settings.song_duration  = tonumber(settings.song_duration)  or defaults.song_duration
+    settings.heal_threshold = tonumber(settings.heal_threshold) or defaults.heal_threshold
 end
 
 -- ─────────────────────────────────────────────────────────
 -- Spell resource lookup
 -- ─────────────────────────────────────────────────────────
 
-local function build_song_lookup()
-    song_lookup = {}
+local function build_spell_lookup()
+    spell_lookup = {}
     for id, spell in pairs(res.spells) do
         local name = spell.en
         if name then
-            song_lookup[name] = {
+            spell_lookup[name] = {
                 spell_id = id,
-                buff_id  = spell.status,  -- may be nil or 0 for some spells
+                buff_id  = spell.status,
             }
         end
     end
 end
 
--- Returns spell_id and buff_id for a song name, or nil, nil.
-local function get_song_data(name)
-    local d = song_lookup[name]
+-- Returns spell_id and buff_id for a spell name, or nil, nil.
+local function get_spell_data(name)
+    local d = spell_lookup[name]
     if not d then return nil, nil end
     return d.spell_id, d.buff_id
+end
+
+-- Resolve the cure spell_id from the current settings.
+local function build_cure_lookup()
+    if not settings then return end
+    local sid = get_spell_data(settings.cure_spell)
+    cure_spell_id = sid
+    if not cure_spell_id then
+        log('Warning: cure spell "' .. tostring(settings.cure_spell) .. '" not found in resources.')
+    end
 end
 
 -- ─────────────────────────────────────────────────────────
@@ -110,14 +133,13 @@ local function slot_name(i)
     return settings['song' .. i]
 end
 
--- Build a reverse map: buff_id → slot index.
--- Only includes slots whose buff_id is known and non-zero.
+-- Build a reverse map: buff_id → slot index (configured songs only).
 local function build_buff_map()
     local m = {}
     for i = 1, settings.song_count do
         local name = slot_name(i)
         if name then
-            local _, buff_id = get_song_data(name)
+            local _, buff_id = get_spell_data(name)
             if buff_id and buff_id ~= 0 then
                 m[buff_id] = i
             end
@@ -127,7 +149,6 @@ local function build_buff_map()
 end
 
 -- Sync active_songs from the player's live buff list.
--- Only stores buff IDs that belong to configured songs.
 local function sync_active_songs()
     active_songs = {}
     local p = windower.ffxi.get_player()
@@ -145,29 +166,67 @@ local function slot_needs_cast(i)
     local name = slot_name(i)
     if not name or name == '' then return false end
 
-    local spell_id, buff_id = get_song_data(name)
-    if not spell_id then return false end  -- spell name not in resources
+    local spell_id, buff_id = get_spell_data(name)
+    if not spell_id then return false end
 
-    -- Cooldown: don't retry too soon after the last cast attempt
     local t = last_cast[name]
     if t and (os.time() - t) < MIN_RECAST_WAIT then return false end
 
     if buff_id and buff_id ~= 0 then
         return not active_songs[buff_id]
     else
-        -- No buff tracking; use time-based fallback
         if not t then return true end
         return (os.time() - t) >= settings.song_duration
     end
 end
 
 -- ─────────────────────────────────────────────────────────
--- Cast logic
+-- Cast logic — healing
 -- ─────────────────────────────────────────────────────────
 
--- Scan all slots and cast the first missing, ready song.
--- Issues only ONE /ma at a time. The action packet handler (below) calls
--- this again after each spell completes to continue the sequence.
+-- Find the party member with the lowest hpp below the threshold who is in
+-- the current zone, and cast the configured cure spell on them.
+local function upkeep_heal()
+    if not settings or not settings.heal_enabled then return end
+    if casting then return end
+    if not is_safe_to_cast() then return end
+    if not cure_spell_id then return end
+
+    -- Check cure spell recast.
+    local ticks = windower.ffxi.get_spell_recasts()[cure_spell_id] or 0
+    if ticks > 0 then return end
+
+    local party = windower.ffxi.get_party()
+    if not party then return end
+
+    local threshold = settings.heal_threshold
+    local target_key = nil
+    local lowest_hpp = threshold  -- only cure members strictly below threshold
+
+    for _, key in ipairs(PARTY_KEYS) do
+        local member = party[key]
+        -- member.mob exists only when the member is in the same zone.
+        if member and member.mob and member.hpp > 0 and member.hpp < lowest_hpp then
+            lowest_hpp  = member.hpp
+            target_key  = key
+        end
+    end
+
+    if not target_key then return end
+
+    local member = party[target_key]
+    log(('Curing %s (%d%% HP) with %s'):format(
+        member.name, member.hpp, settings.cure_spell))
+    windower.chat.input('/ma "' .. settings.cure_spell .. '" <' .. target_key .. '>')
+    casting         = true
+    cast_started_at = os.time()
+end
+
+-- ─────────────────────────────────────────────────────────
+-- Cast logic — songs
+-- ─────────────────────────────────────────────────────────
+
+-- Scan all song slots and cast the first missing, ready one.
 local function upkeep_songs()
     if not settings or not settings.enabled then return end
     if casting then return end
@@ -176,10 +235,8 @@ local function upkeep_songs()
     for i = 1, settings.song_count do
         if slot_needs_cast(i) then
             local name     = slot_name(i)
-            local spell_id = get_song_data(name)
+            local spell_id = get_spell_data(name)
 
-            -- If the spell is still on recast, skip to the next slot.
-            -- The prerender quick-check will retry when it clears.
             local ticks = windower.ffxi.get_spell_recasts()[spell_id] or 0
             if ticks == 0 then
                 log('Casting ' .. name)
@@ -187,9 +244,17 @@ local function upkeep_songs()
                 last_cast[name]  = os.time()
                 casting          = true
                 cast_started_at  = os.time()
-                return  -- One cast at a time; action packet drives the next
+                return
             end
         end
+    end
+end
+
+-- Unified upkeep: healing takes priority over song maintenance.
+local function upkeep()
+    upkeep_heal()
+    if not casting then
+        upkeep_songs()
     end
 end
 
@@ -203,37 +268,30 @@ end
 
 windower.register_event('incoming chunk', function(id, data)
     if id ~= 0x028 then return end
-    if not settings or not settings.enabled then return end
+    if not settings then return end
 
     local act = windower.packets.parse_action(data)
     local p   = windower.ffxi.get_player()
     if not p or act.actor_id ~= p.id then return end
 
-    -- Category 8: spell cast initiated or interrupted
     if act.category == 8 then
         if act.param == 28787 then
-            -- Our cast was interrupted. Clear the flag and schedule a retry
-            -- after MIN_RECAST_WAIT so we don't immediately hit the lockout.
             casting = false
             log('Cast interrupted. Will retry in ' .. MIN_RECAST_WAIT .. 's.')
             coroutine.wrap(function()
                 coroutine.sleep(MIN_RECAST_WAIT + 2)
-                upkeep_songs()
+                upkeep()
             end)()
         end
-        -- param == 24931 means the cast started; casting flag stays true.
 
-    -- Category 4: spell cast completed
     elseif act.category == 4 then
-        -- Any spell completion from us while casting = true means our cast
-        -- finished. Update active_songs immediately (gain buff fires shortly
-        -- after, but this keeps state tight).
         if casting then
+            -- Update active_songs immediately for song completions.
             local completed_spell_id = act.param
             for i = 1, settings.song_count do
                 local name = slot_name(i)
                 if name then
-                    local sid, bid = get_song_data(name)
+                    local sid, bid = get_spell_data(name)
                     if sid == completed_spell_id and bid and bid ~= 0 then
                         if act.targets and act.targets[1] and act.targets[1].id == p.id then
                             active_songs[bid] = true
@@ -243,10 +301,9 @@ windower.register_event('incoming chunk', function(id, data)
                 end
             end
             casting = false
-            -- Brief pause, then check whether more songs still need casting.
             coroutine.wrap(function()
                 coroutine.sleep(1)
-                upkeep_songs()
+                upkeep()
             end)()
         end
     end
@@ -259,18 +316,21 @@ end)
 windower.register_event('load', function()
     settings = config.load(defaults)
     coerce_settings()
-    build_song_lookup()
+    build_spell_lookup()
+    build_cure_lookup()
     sync_active_songs()
-    log(('Loaded v%s. Enabled: %s | %s / %s'):format(
+    log(('Loaded v%s. Songs: %s | %s   Heal: %s (threshold %d%%, %s)'):format(
         _addon.version,
-        tostring(settings.enabled),
         slot_name(1) or '(none)',
-        slot_name(2) or '(none)'
+        slot_name(2) or '(none)',
+        tostring(settings.heal_enabled),
+        settings.heal_threshold,
+        settings.cure_spell
     ))
     if settings.enabled then
         coroutine.wrap(function()
             coroutine.sleep(1)
-            upkeep_songs()
+            upkeep()
         end)()
     end
 end)
@@ -280,17 +340,17 @@ windower.register_event('unload', function()
 end)
 
 windower.register_event('login', function()
-    build_song_lookup()
+    build_spell_lookup()
+    build_cure_lookup()
     sync_active_songs()
     if settings and settings.enabled then
         coroutine.wrap(function()
             coroutine.sleep(2)
-            upkeep_songs()
+            upkeep()
         end)()
     end
 end)
 
--- React to gaining a buff: mark the matching song slot as active.
 windower.register_event('gain buff', function(buff_id)
     if not settings then return end
     local buff_map = build_buff_map()
@@ -299,7 +359,6 @@ windower.register_event('gain buff', function(buff_id)
     end
 end)
 
--- React to losing a buff: mark slot as gone and trigger re-cast.
 windower.register_event('lose buff', function(buff_id)
     if not settings then return end
     local buff_map = build_buff_map()
@@ -307,18 +366,16 @@ windower.register_event('lose buff', function(buff_id)
         active_songs[buff_id] = nil
         local slot = buff_map[buff_id]
         log(('Song slot %d ("%s") fell off — recasting.'):format(slot, slot_name(slot) or '?'))
-        upkeep_songs()
+        upkeep()
     end
 end)
 
--- Zone change: all buffs are cleared server-side; reset tracking.
 windower.register_event('zone change', function()
     active_songs = {}
     last_cast    = {}
     casting      = false
 end)
 
--- Status change: pause on death/zoning; resume on idle/engaged.
 windower.register_event('status change', function(new_status)
     if not settings then return end
     if new_status == STATUS_DEAD or new_status == STATUS_ZONING then
@@ -328,20 +385,29 @@ windower.register_event('status change', function(new_status)
         coroutine.wrap(function()
             coroutine.sleep(1)
             sync_active_songs()
-            upkeep_songs()
+            upkeep()
         end)()
     end
 end)
 
 -- Periodic checks via prerender:
---   Every ~5s  — quick upkeep (catches spells waiting on recast to clear).
---   Every ~60s — full sync (catches any missed buff events).
---   Also resets a stuck casting flag if it's been true for over 30 seconds.
+--   Every ~1s  — party HP check for healing.
+--   Every ~5s  — song recast polling.
+--   Every ~60s — full buff sync.
 windower.register_event('prerender', function()
-    if not settings or not settings.enabled then return end
-    poll_tick = poll_tick + 1
+    if not settings then return end
 
-    if poll_tick >= 3600 then  -- ~60s at 60 fps
+    -- Healing check: ~1s regardless of enabled flag (heal_enabled controls it internally).
+    heal_tick = heal_tick + 1
+    if heal_tick >= 60 then
+        heal_tick = 0
+        upkeep_heal()
+    end
+
+    if not settings.enabled then return end
+
+    poll_tick = poll_tick + 1
+    if poll_tick >= 3600 then  -- ~60s
         poll_tick = 0
         if casting and (os.time() - cast_started_at) > 60 then
             log('Cast timed out — resetting.')
@@ -372,20 +438,69 @@ windower.register_event('addon command', function(cmd, ...)
         settings:save('all')
         log('Enabled.')
         sync_active_songs()
-        upkeep_songs()
+        upkeep()
 
     elseif cmd == 'off' then
         settings.enabled = false
         settings:save('all')
         log('Disabled.')
 
+    -- ── heal on / off ─────────────────────────────────────
+    elseif cmd == 'heal' then
+        local sub = args[1] and args[1]:lower()
+        if sub == 'on' then
+            settings.heal_enabled = true
+            settings:save('all')
+            log('Healing enabled.')
+        elseif sub == 'off' then
+            settings.heal_enabled = false
+            settings:save('all')
+            log('Healing disabled.')
+        else
+            log('Usage: //ha heal on|off')
+        end
+
+    -- ── threshold <pct> ───────────────────────────────────
+    elseif cmd == 'threshold' then
+        local pct = tonumber(args[1])
+        if not pct or pct < 1 or pct > 99 then
+            log('Usage: //ha threshold <1-99>')
+            return
+        end
+        settings.heal_threshold = pct
+        settings:save('all')
+        log(('Heal threshold set to %d%%.'):format(pct))
+
+    -- ── cure <spell name> ─────────────────────────────────
+    elseif cmd == 'cure' then
+        local name = table.concat(args, ' ', 1)
+        if name == '' then
+            log('Usage: //ha cure <Spell Name>')
+            return
+        end
+        local spell_id = get_spell_data(name)
+        if not spell_id then
+            log(('Unknown spell: "%s" — check spelling and capitalisation.'):format(name))
+            return
+        end
+        settings.cure_spell = name
+        settings:save('all')
+        build_cure_lookup()
+        log(('Cure spell set to: %s'):format(name))
+
     -- ── status ────────────────────────────────────────────
     elseif cmd == 'status' then
         log(('Enabled: %s   Casting lock: %s'):format(
             tostring(settings.enabled), tostring(casting)))
+        log(('Heal: %s   Threshold: %d%%   Cure: %s%s'):format(
+            tostring(settings.heal_enabled),
+            settings.heal_threshold,
+            settings.cure_spell,
+            cure_spell_id and '' or ' (!! not found in resources)'
+        ))
         for i = 1, settings.song_count do
             local name               = slot_name(i) or '(none)'
-            local spell_id, buff_id  = get_song_data(name)
+            local spell_id, buff_id  = get_spell_data(name)
             local has_buff_tracking  = buff_id and buff_id ~= 0
             local active
             if has_buff_tracking then
@@ -411,7 +526,7 @@ windower.register_event('addon command', function(cmd, ...)
         local recasts = windower.ffxi.get_spell_recasts()
         for i = 1, settings.song_count do
             local name     = slot_name(i) or '(none)'
-            local spell_id = get_song_data(name)
+            local spell_id = get_spell_data(name)
             if spell_id then
                 local ticks = recasts[spell_id] or 0
                 local secs  = math.ceil(ticks / 60)
@@ -432,7 +547,7 @@ windower.register_event('addon command', function(cmd, ...)
             return
         end
 
-        local spell_id = get_song_data(name)
+        local spell_id = get_spell_data(name)
         if not spell_id then
             log(('Unknown song: "%s" — check spelling and capitalisation.'):format(name))
             return
@@ -442,10 +557,11 @@ windower.register_event('addon command', function(cmd, ...)
         settings:save('all')
         sync_active_songs()
         log(('Slot %d set to: %s'):format(slot, name))
-        upkeep_songs()
+        upkeep()
 
     -- ── help / fallthrough ────────────────────────────────
     else
         log('Commands:  on | off | status | recast | song <1|2> <name>')
+        log('           heal on|off | threshold <1-99> | cure <spell name>')
     end
 end)
