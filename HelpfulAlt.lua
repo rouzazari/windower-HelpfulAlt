@@ -365,7 +365,7 @@ windower.register_event('lose buff', function(buff_id)
     if buff_map[buff_id] then
         active_songs[buff_id] = nil
         local slot = buff_map[buff_id]
-        log(('Song slot %d ("%s") fell off — recasting.'):format(slot, slot_name(slot) or '?'))
+        log(('Song slot %d ("%s") fell off - recasting.'):format(slot, slot_name(slot) or '?'))
         upkeep()
     end
 end)
@@ -410,14 +410,14 @@ windower.register_event('prerender', function()
     if poll_tick >= 3600 then  -- ~60s
         poll_tick = 0
         if casting and (os.time() - cast_started_at) > 60 then
-            log('Cast timed out — resetting.')
+            log('Cast timed out - resetting.')
             casting = false
         end
         sync_active_songs()
         upkeep_songs()
     elseif poll_tick % 300 == 0 then  -- ~5s
         if casting and (os.time() - cast_started_at) > 30 then
-            log('Cast timed out — resetting.')
+            log('Cast timed out - resetting.')
             casting = false
         end
         upkeep_songs()
@@ -480,7 +480,7 @@ windower.register_event('addon command', function(cmd, ...)
         end
         local spell_id = get_spell_data(name)
         if not spell_id then
-            log(('Unknown spell: "%s" — check spelling and capitalisation.'):format(name))
+            log(('Unknown spell: "%s" - check spelling and capitalisation.'):format(name))
             return
         end
         settings.cure_spell = name
@@ -549,7 +549,7 @@ windower.register_event('addon command', function(cmd, ...)
 
         local spell_id = get_spell_data(name)
         if not spell_id then
-            log(('Unknown song: "%s" — check spelling and capitalisation.'):format(name))
+            log(('Unknown song: "%s" - check spelling and capitalisation.'):format(name))
             return
         end
 
