@@ -2,7 +2,7 @@
 
 > A Windower 4 addon that autonomously controls a secondary FFXI account playing a healer or support role. Designed to keep your alt running hands-free while you focus on your main character.
 
-**Version:** 3.0.0
+**Version:** 4.0.0
 **Command:** `//ha` or `//helpfulalt`
 
 ---
@@ -43,7 +43,7 @@
 
 ## Usage
 
-HelpfulAlt starts fully enabled by default. On load it will immediately check whether your configured songs are active and whether any party members need healing.
+HelpfulAlt starts fully enabled by default. On load it will immediately check whether your configured songs are active, whether any party members need healing, and whether any party members have removable debuffs.
 
 Enable or disable all automation at any time:
 
@@ -77,6 +77,13 @@ Check current state:
 | `//ha threshold <1-99>` | Set HP% at which to cure (default: 80) |
 | `//ha cure <name>` | Set the cure spell to use (default: Cure IV) |
 
+### Debuff removal
+
+| Command | Description |
+|---|---|
+| `//ha debuff on` | Enable debuff removal |
+| `//ha debuff off` | Disable debuff removal |
+
 ### Examples
 
     //ha song 1 Blade Madrigal
@@ -86,6 +93,7 @@ Check current state:
     //ha heal off
     //ha threshold 75
     //ha cure Cure V
+    //ha debuff off
 
 Song and spell names are case-sensitive and must match the in-game spell name exactly.
 
@@ -113,6 +121,12 @@ Settings are saved automatically to `data/settings.xml` on first load. You can e
 | `heal_threshold` | `80` | Cure a party member when their HP% falls below this value |
 | `cure_spell` | `Cure IV` | Spell used to heal party members |
 
+### Debuff settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `debuff_enabled` | `true` | Whether debuff removal is active on load |
+
 ---
 
 ## How It Works
@@ -130,9 +144,15 @@ Each configured song is monitored using two complementary strategies:
 
 A quick safety-net check runs every ~5 seconds (for recast polling) and a full buff sync runs every ~60 seconds, catching any missed events or edge cases.
 
+### Debuff removal
+
+The addon listens for the party buffs packet (0x076), which fires whenever any party member's buff list changes. When received, it decodes each member's full buff list (up to 32 slots, using a two-bit extension stored in a bitmask field for IDs above 255) and stores any recognized debuffs keyed by mob ID.
+
+When `upkeep_debuff()` runs, it scans party members in order and checks their stored debuffs against the priority list: Doom > Curse > Petrification > Paralysis > Plague > Silence > Blindness > Poison > Disease. The first match where the removal spell is known (`get_spells()`) and off recast is cast immediately. Debuff removal takes priority over song upkeep but runs after healing.
+
 ### Cast sequencing
 
-Only one spell is ever in flight at a time. After each spell completes, an incoming action packet (category 4) triggers the next cast automatically — first checking for party members who need healing, then checking for missing songs. If a spell is on recast, that slot is skipped; the periodic check resumes it once the recast clears.
+Only one spell is ever in flight at a time. After each spell completes, an incoming action packet (category 4) triggers the next cast automatically — first checking for party members who need healing, then checking for debuffs to remove, then checking for missing songs. If a spell is on recast, that slot is skipped; the periodic check resumes it once the recast clears.
 
 ### Interruption handling
 
@@ -152,19 +172,16 @@ Autonomous maintenance of two configurable songs. Reactive buff tracking with ti
 ### ✅ Milestone 2 — Robustness & Action-Packet Sequencing
 Cast sequencing driven by incoming action packets instead of a timed delay. Interruption detection via packet category. Faster recast polling. Fixed numeric config coercion bug that prevented the second song from casting.
 
-### ✅ Milestone 3 — Party Healing *(current)*
+### ✅ Milestone 3 — Party Healing
 Monitor party HP% and cure members below a configurable threshold. Healing takes priority over song upkeep. Configurable cure spell and HP threshold.
 
-### Milestone 4 — 3 and 4 Song Support
+### ✅ Milestone 4 — Debuff Removal *(current)*
+Track party member debuffs via 0x076 packets. Priority-ordered removal (Doom > Curse > Petrify > Paralysis > Plague > Silence > Blindness > Poison > Disease). Job-aware via `get_spells()`. Debuff removal runs between healing and song upkeep in the shared casting lock.
+
+### Milestone 5 — 3 and 4 Song Support
 - Expand `song_count` to support up to 4 slots
 - Detect available song capacity from equipped gear/traits
 - Sequential casting order with configurable priority
-
-### Milestone 5 — Debuff Removal
-- Detect debuffs on party members via party buff packets
-- Priority-ordered removal (Poison → Curse → Paralysis → Blind → Silence → etc.)
-- Job-aware: only attempts spells available on the current job
-- Commands: `//ha debuff on/off`
 
 ### Milestone 6 — Main Healer Mode
 - Full autonomous healing loop suitable for being the primary healer
@@ -175,6 +192,14 @@ Monitor party HP% and cure members below a configurable threshold. Healing takes
 ---
 
 ## Change Log
+
+### 4.0.0
+- Added: Debuff removal — tracks party member debuffs via 0x076 packet and casts -na spells in priority order (Doom > Curse > Petrification > Paralysis > Plague > Silence > Blindness > Poison > Disease)
+- Added: Debuff removal respects the shared casting lock (healing > debuff > songs)
+- Added: Job-aware spell selection via `windower.ffxi.get_spells()` — only attempts spells the character has learned
+- Added: `//ha debuff on/off` command and `debuff_enabled` setting
+- Updated: `//ha status` now shows debuff enabled state and tracked debuff count
+- Updated: 0x076 handler triggers `upkeep_debuff()` immediately when party buffs change
 
 ### 3.0.0
 - Added: Party healing — polls party HP% every ~1 second and casts a configurable cure spell when any in-zone member falls below the threshold
@@ -208,6 +233,7 @@ Monitor party HP% and cure members below a configurable threshold. Healing takes
 ## Known Issues
 
 - Song and spell names must be spelled and capitalised exactly as they appear in-game (e.g. `Cure IV`, not `cure iv`). Use `//ha status` to verify a spell was found in resources.
-- If the character is silenced, the addon will continuously attempt to cast songs until silence is removed. Silence detection will be addressed in a future milestone.
+- If the character is silenced, the addon will continuously attempt to cast songs until silence is removed. Silena is detected as a debuff and will be cast on affected party members, but self-silence is not yet handled specially.
 - `song_count` must currently be set by editing `data/settings.xml` directly. A runtime command will be added in a future milestone.
-- The cure spell is not automatically selected based on the current job — set it manually with `//ha cure <name>` or in `data/settings.xml`.
+- The cure and removal spells are not automatically filtered by current job level — the addon checks only whether the spell has been learned (`get_spells()`). If the current job cannot use a spell, the server will reject the cast and the interruption handler will clear the lock.
+- Debuff tracking relies on 0x076 packets. The initial state is empty on load; debuffs are populated on the next buff change event for each party member.
