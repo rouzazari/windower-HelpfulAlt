@@ -179,15 +179,17 @@ Monitor party HP% and cure members below a configurable threshold. Healing takes
 Track party member debuffs via 0x076 packets. Priority-ordered removal (Doom > Curse > Petrify > Paralysis > Plague > Silence > Blindness > Poison > Disease). Job-aware via `get_spells()`. Debuff removal runs between healing and song upkeep in the shared casting lock.
 
 ### Milestone 5 — 3 and 4 Song Support
-- Expand `song_count` to support up to 4 slots
-- Detect available song capacity from equipped gear/traits
-- Sequential casting order with configurable priority
+- Expand `song_count` to support up to 4 slots (`song3`, `song4` config keys)
+- `//ha song 3 <name>` / `//ha song 4 <name>` commands
+- `//ha status` and `//ha recast` show all active slots
 
-### Milestone 6 — Main Healer Mode
-- Full autonomous healing loop suitable for being the primary healer
-- MP management with configurable floor — rests to recover when low
-- Emergency priority for sudden HP drops and KO'd party members
-- Commands: `//ha healer on/off`, `//ha mpfloor <pct>`
+### Milestone 6 — MP Rest and Raise
+- Monitor own MP% and enter `/heal` when it drops below a configurable floor
+- Resume when MP recovers to a configurable ceiling
+- Resting is suppressed while anyone needs healing, raising, or debuffing
+- Detect KO'd party members and cast Raise (configurable spell)
+- Priority stack: Raise > Heal > Debuff > Rest > Songs
+- Commands: `//ha rest on/off`, `//ha mpfloor <pct>`, `//ha mpceil <pct>`, `//ha raise <spell>`
 
 ---
 
