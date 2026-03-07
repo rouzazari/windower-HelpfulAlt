@@ -365,7 +365,8 @@ windower.register_event('incoming chunk', function(id, data)
     -- Buff ID = low_byte + 256 * ext_bits  (ext_bits = 2 bits from BitMask)
     if id == 0x076 then
         for i = 0, 4 do
-            local mob_id = data:unpack('I', i*48+5)
+            local b = i*48+5
+            local mob_id = data:byte(b) + data:byte(b+1)*256 + data:byte(b+2)*65536 + data:byte(b+3)*16777216
             if mob_id == 0 then break end
             local debuffs = {}
             for n = 1, 32 do
