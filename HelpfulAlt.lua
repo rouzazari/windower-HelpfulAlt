@@ -77,6 +77,9 @@ local cure_spell_id   = nil    -- resolved spell_id for the configured cure spel
 local party_debuffs   = {}     -- [mob_id] = {[buff_id] = true}; updated from 0x076
 local debuff_id_map   = {}     -- [buff_id] = {name, spell_name}; built from res.buffs
 local debuff_priority = {}     -- ordered list of {buff_id, name, spell_name}
+local last_pos_x      = nil    -- last known x coordinate (movement detection)
+local last_pos_z      = nil    -- last known z coordinate (movement detection)
+local still_frames    = 0      -- frames since position last changed
 
 -- Player status constants
 local STATUS_IDLE     = 0
@@ -89,6 +92,9 @@ local PARTY_KEYS = {'p0', 'p1', 'p2', 'p3', 'p4', 'p5'}
 
 -- Minimum seconds before retrying after a /ma (covers interruption lockout).
 local MIN_RECAST_WAIT = 10
+
+-- Frames of unchanged position before the character is considered still (~0.25s at 60fps).
+local STILL_THRESHOLD = 15
 
 -- ---------------------------------------------------------
 -- Helpers
@@ -105,7 +111,8 @@ end
 
 local function is_safe_to_cast()
     local s = player_status()
-    return s == STATUS_IDLE or s == STATUS_ENGAGED
+    if s ~= STATUS_IDLE and s ~= STATUS_ENGAGED then return false end
+    return still_frames >= STILL_THRESHOLD
 end
 
 -- Coerce numeric/bool settings after config.load (XML may load them as strings).
@@ -494,6 +501,9 @@ windower.register_event('zone change', function()
     last_cast     = {}
     casting       = false
     party_debuffs = {}
+    last_pos_x    = nil
+    last_pos_z    = nil
+    still_frames  = 0
 end)
 
 windower.register_event('status change', function(new_status)
@@ -517,6 +527,23 @@ end)
 --   Every ~60s - full buff sync + upkeep.
 windower.register_event('prerender', function()
     if not settings then return end
+
+    -- Movement detection: compare position each frame; trigger upkeep the moment we stop.
+    local me = windower.ffxi.get_mob_by_target('me')
+    if me then
+        local was_still = still_frames >= STILL_THRESHOLD
+        if last_pos_x and (me.x ~= last_pos_x or me.z ~= last_pos_z) then
+            still_frames = 0
+        else
+            still_frames = math.min(still_frames + 1, STILL_THRESHOLD)
+        end
+        last_pos_x = me.x
+        last_pos_z = me.z
+        -- Fire upkeep immediately when the character comes to a stop.
+        if not was_still and still_frames >= STILL_THRESHOLD and not casting then
+            upkeep()
+        end
+    end
 
     -- Healing check: ~1s regardless of enabled flag (heal_enabled controls it internally).
     heal_tick = heal_tick + 1
