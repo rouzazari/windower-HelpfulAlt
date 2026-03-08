@@ -384,8 +384,12 @@ local function upkeep_follow()
     -- mob.distance is squared yalms; compare against threshold^2.
     local threshold_sq = settings.follow_distance * settings.follow_distance
     if target.distance > threshold_sq then
-        windower.chat.input('/follow ' .. settings.follow_target)
-        is_following = true
+        -- Only issue /follow on the transition to following; re-issuing it would
+        -- toggle follow OFF since /follow is a toggle command in FFXI.
+        if not is_following then
+            windower.chat.input('/follow ' .. settings.follow_target)
+            is_following = true
+        end
     else
         is_following = false
     end
