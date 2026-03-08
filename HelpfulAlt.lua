@@ -365,7 +365,8 @@ end
 -- the configured ballad. Uses Windower's built-in ;wait; command chaining so
 -- no coroutine sleep is needed between the JA and the song cast.
 local function upkeep_mp_ballad()
-    if not settings or not settings.mp_ballad_enabled then return end
+    if not settings or not settings.heal_enabled then return end
+    if not settings.mp_ballad_enabled then return end
     if casting then return end
     if cast_cooldown > 0 then return end
     if not is_safe_to_cast() then return end
