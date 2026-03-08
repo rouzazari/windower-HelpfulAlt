@@ -19,10 +19,13 @@
         //ha follow <name>          - follow a named character
         //ha follow off             - disable following
         //ha followdist <yalms>     - set follow stop distance (default: 10)
+        //ha ballad on|off          - toggle Pianissimo+Ballad MP recovery
+        //ha ballad <spell name>    - set which ballad to use (default: Mage's Ballad II)
+        //ha mpfloor <1-99>         - set MP% below which to cast the ballad (default: 75)
 ]]
 
 _addon.name     = 'HelpfulAlt'
-_addon.version  = '4.1.0'
+_addon.version  = '4.2.0'
 _addon.author   = 'User'
 _addon.commands = {'helpfulalt', 'ha'}
 
@@ -50,6 +53,10 @@ local defaults = {
     follow_enabled  = false,
     follow_target   = '',
     follow_distance = 10,
+    -- MP recovery via Pianissimo + Ballad
+    mp_ballad_enabled   = true,
+    mp_ballad_threshold = 75,
+    mp_ballad_spell     = "Mage's Ballad II",
 }
 
 -- Debuff English name (lowercase) -> removal spell.
@@ -90,8 +97,9 @@ local last_pos_x      = nil    -- last known x coordinate (movement detection)
 local last_pos_z      = nil    -- last known z coordinate (movement detection)
 local still_frames    = 0      -- frames since position last changed
 local cast_cooldown   = 0      -- frames remaining in post-cast lock (songs/debuffs only)
-local follow_tick     = 0      -- prerender counter for follow distance check (~2s)
-local is_following    = false  -- true while /follow has been issued and not yet cancelled
+local follow_tick          = 0      -- prerender counter for follow distance check (~2s)
+local is_following         = false  -- true while /follow has been issued and not yet cancelled
+local pianissimo_recast_id = nil    -- recast_id for Pianissimo JA, resolved from res.job_abilities
 
 -- Player status constants
 local STATUS_IDLE     = 0
@@ -136,7 +144,8 @@ local function coerce_settings()
     settings.song_count     = tonumber(settings.song_count)     or defaults.song_count
     settings.song_duration  = tonumber(settings.song_duration)  or defaults.song_duration
     settings.heal_threshold = tonumber(settings.heal_threshold) or defaults.heal_threshold
-    settings.follow_distance = tonumber(settings.follow_distance) or defaults.follow_distance
+    settings.follow_distance    = tonumber(settings.follow_distance)    or defaults.follow_distance
+    settings.mp_ballad_threshold = tonumber(settings.mp_ballad_threshold) or defaults.mp_ballad_threshold
 end
 
 -- ---------------------------------------------------------
@@ -194,6 +203,17 @@ local function build_debuff_lookup()
                 break
             end
         end
+    end
+end
+
+-- Resolve Pianissimo's recast_id from job_abilities resources.
+-- Used by upkeep_mp_ballad() to check if the JA is available.
+local function build_pianissimo_lookup()
+    local abil = res.job_abilities and res.job_abilities:with('en', 'Pianissimo')
+    if abil then
+        pianissimo_recast_id = abil.recast_id
+    else
+        log('Warning: Pianissimo not found in job_abilities resources.')
     end
 end
 
@@ -338,6 +358,43 @@ local function upkeep_debuff()
 end
 
 -- ---------------------------------------------------------
+-- Cast logic - MP recovery (Pianissimo + Ballad)
+-- ---------------------------------------------------------
+
+-- When own MP% falls below mp_ballad_threshold, cast Pianissimo on self then
+-- the configured ballad. Uses Windower's built-in ;wait; command chaining so
+-- no coroutine sleep is needed between the JA and the song cast.
+local function upkeep_mp_ballad()
+    if not settings or not settings.mp_ballad_enabled then return end
+    if casting then return end
+    if cast_cooldown > 0 then return end
+    if not is_safe_to_cast() then return end
+
+    local player = windower.ffxi.get_player()
+    if not player or player.mpp >= settings.mp_ballad_threshold then return end
+
+    -- Pianissimo must be off recast.
+    if pianissimo_recast_id then
+        local ab_recasts = windower.ffxi.get_ability_recasts()
+        if (ab_recasts[pianissimo_recast_id] or 0) > 0 then return end
+    end
+
+    -- Ballad spell must be known and off recast.
+    local spell_id = get_spell_data(settings.mp_ballad_spell)
+    if not spell_id then
+        log('Warning: mp_ballad_spell "' .. tostring(settings.mp_ballad_spell) .. '" not found in resources.')
+        return
+    end
+    if (windower.ffxi.get_spell_recasts()[spell_id] or 0) > 0 then return end
+
+    log(('MP %d%% - Pianissimo + %s'):format(player.mpp, settings.mp_ballad_spell))
+    casting         = true
+    cast_started_at = os.time()
+    -- Windower's ;wait; syntax sequences the JA and song without a coroutine.
+    windower.send_command('input /ja "Pianissimo" <me>;wait 1.5;input /ma "' .. settings.mp_ballad_spell .. '" <me>')
+end
+
+-- ---------------------------------------------------------
 -- Cast logic - songs
 -- ---------------------------------------------------------
 
@@ -395,10 +452,11 @@ local function upkeep_follow()
     end
 end
 
--- Unified upkeep: healing > debuff removal > song maintenance.
+-- Unified upkeep: healing > debuff removal > MP ballad > song maintenance.
 local function upkeep()
     upkeep_heal()
     if not casting then upkeep_debuff() end
+    if not casting then upkeep_mp_ballad() end
     if not casting then upkeep_songs() end
 end
 
@@ -493,6 +551,7 @@ windower.register_event('load', function()
     build_spell_lookup()
     build_cure_lookup()
     build_debuff_lookup()
+    build_pianissimo_lookup()
     sync_active_songs()
     log(('Loaded v%s. Songs: %s | %s   Heal: %s (%d%%, %s)   Debuff: %s'):format(
         _addon.version,
@@ -519,6 +578,7 @@ windower.register_event('login', function()
     build_spell_lookup()
     build_cure_lookup()
     build_debuff_lookup()
+    build_pianissimo_lookup()
     sync_active_songs()
     if settings and settings.enabled then
         coroutine.wrap(function()
@@ -735,6 +795,12 @@ windower.register_event('addon command', function(cmd, ...)
             tostring(settings.debuff_enabled),
             #debuff_priority
         ))
+        log(('MP Ballad: %s   Floor: %d%%   Spell: %s%s'):format(
+            tostring(settings.mp_ballad_enabled),
+            settings.mp_ballad_threshold,
+            settings.mp_ballad_spell,
+            pianissimo_recast_id and '' or ' (!! Pianissimo not found in resources)'
+        ))
         if settings.follow_enabled then
             log(('Follow: ON   Target: %s   Stop at: %d yalms   Active: %s'):format(
                 settings.follow_target ~= '' and settings.follow_target or '(none)',
@@ -835,11 +901,48 @@ windower.register_event('addon command', function(cmd, ...)
         settings:save('all')
         log(('Follow stop distance set to %d yalms.'):format(dist))
 
+    -- ballad on|off  /  ballad <spell name>
+    elseif cmd == 'ballad' then
+        local sub = args[1] and args[1]:lower()
+        if sub == 'on' then
+            settings.mp_ballad_enabled = true
+            settings:save('all')
+            log('MP ballad enabled.')
+        elseif sub == 'off' then
+            settings.mp_ballad_enabled = false
+            settings:save('all')
+            log('MP ballad disabled.')
+        elseif sub and sub ~= '' then
+            local name = table.concat(args, ' ', 1)
+            local spell_id = get_spell_data(name)
+            if not spell_id then
+                log(('Unknown spell: "%s" - check spelling and capitalisation.'):format(name))
+                return
+            end
+            settings.mp_ballad_spell = name
+            settings:save('all')
+            log(('MP ballad spell set to: %s'):format(name))
+        else
+            log('Usage: //ha ballad on|off  or  //ha ballad <Spell Name>')
+        end
+
+    -- mpfloor <pct>
+    elseif cmd == 'mpfloor' then
+        local pct = tonumber(args[1])
+        if not pct or pct < 1 or pct > 99 then
+            log('Usage: //ha mpfloor <1-99>')
+            return
+        end
+        settings.mp_ballad_threshold = pct
+        settings:save('all')
+        log(('MP ballad threshold set to %d%%.'):format(pct))
+
     -- help / fallthrough
     else
         log('Commands:  on | off | status | recast | song <1|2> <name>')
         log('           heal on|off | threshold <1-99> | cure <spell name>')
         log('           debuff on|off')
+        log('           ballad on|off | ballad <spell name> | mpfloor <1-99>')
         log('           follow <name> | follow off | followdist <yalms>')
     end
 end)

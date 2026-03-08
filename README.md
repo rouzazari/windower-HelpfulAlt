@@ -2,7 +2,7 @@
 
 > A Windower 4 addon that autonomously controls a secondary FFXI account playing a healer or support role. Designed to keep your alt running hands-free while you focus on your main character.
 
-**Version:** 4.1.0
+**Version:** 4.2.0
 **Command:** `//ha` or `//helpfulalt`
 
 ---
@@ -84,6 +84,15 @@ Check current state:
 | `//ha debuff on` | Enable debuff removal |
 | `//ha debuff off` | Disable debuff removal |
 
+### MP recovery
+
+| Command | Description |
+|---|---|
+| `//ha ballad on` | Enable Pianissimo+Ballad MP recovery |
+| `//ha ballad off` | Disable MP recovery |
+| `//ha ballad <name>` | Set which ballad to use (default: Mage's Ballad II) |
+| `//ha mpfloor <1-99>` | Set MP% below which to cast the ballad (default: 75) |
+
 ### Follow
 
 | Command | Description |
@@ -137,6 +146,14 @@ Settings are saved automatically to `data/settings.xml` on first load. You can e
 | Setting | Default | Description |
 |---|---|---|
 | `debuff_enabled` | `true` | Whether debuff removal is active on load |
+
+### MP recovery settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `mp_ballad_enabled` | `true` | Whether Pianissimo+Ballad MP recovery is active on load |
+| `mp_ballad_threshold` | `75` | Cast the ballad when own MP% falls below this value |
+| `mp_ballad_spell` | `Mage's Ballad II` | Ballad spell to use for MP recovery |
 
 ### Follow settings
 
