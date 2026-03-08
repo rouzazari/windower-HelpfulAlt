@@ -426,7 +426,7 @@ windower.register_event('incoming chunk', function(id, data)
             end
             casting = false
             coroutine.wrap(function()
-                coroutine.sleep(1)
+                coroutine.sleep(2)
                 upkeep()
             end)()
         end
