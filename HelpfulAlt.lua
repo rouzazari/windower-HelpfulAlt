@@ -80,6 +80,7 @@ local debuff_priority = {}     -- ordered list of {buff_id, name, spell_name}
 local last_pos_x      = nil    -- last known x coordinate (movement detection)
 local last_pos_z      = nil    -- last known z coordinate (movement detection)
 local still_frames    = 0      -- frames since position last changed
+local cast_cooldown   = 0      -- frames remaining in post-cast lock (songs/debuffs only)
 
 -- Player status constants
 local STATUS_IDLE     = 0
@@ -95,6 +96,10 @@ local MIN_RECAST_WAIT = 10
 
 -- Frames of unchanged position before the character is considered still (~0.25s at 60fps).
 local STILL_THRESHOLD = 15
+
+-- Frames after a cast completes before songs/debuffs can be cast again.
+-- Covers the client-side animation lock that persists after the category 4 packet.
+local CAST_COOLDOWN_FRAMES = 150  -- ~2.5s at 60fps
 
 -- ---------------------------------------------------------
 -- Helpers
@@ -285,6 +290,7 @@ end
 local function upkeep_debuff()
     if not settings or not settings.debuff_enabled then return end
     if casting then return end
+    if cast_cooldown > 0 then return end
     if not is_safe_to_cast() then return end
 
     local party = windower.ffxi.get_party()
@@ -327,6 +333,7 @@ end
 local function upkeep_songs()
     if not settings or not settings.enabled then return end
     if casting then return end
+    if cast_cooldown > 0 then return end
     if not is_safe_to_cast() then return end
 
     for i = 1, settings.song_count do
@@ -400,7 +407,8 @@ windower.register_event('incoming chunk', function(id, data)
 
     if act.category == 8 then
         if act.param == 28787 then
-            casting = false
+            casting       = false
+            cast_cooldown = CAST_COOLDOWN_FRAMES
             log('Cast interrupted. Will retry in ' .. MIN_RECAST_WAIT .. 's.')
             coroutine.wrap(function()
                 coroutine.sleep(MIN_RECAST_WAIT + 2)
@@ -424,9 +432,10 @@ windower.register_event('incoming chunk', function(id, data)
                     end
                 end
             end
-            casting = false
+            casting       = false
+            cast_cooldown = CAST_COOLDOWN_FRAMES
             coroutine.wrap(function()
-                coroutine.sleep(2)
+                coroutine.sleep(1)
                 upkeep()
             end)()
         end
@@ -501,6 +510,7 @@ windower.register_event('zone change', function()
     active_songs  = {}
     last_cast     = {}
     casting       = false
+    cast_cooldown = 0
     party_debuffs = {}
     last_pos_x    = nil
     last_pos_z    = nil
@@ -528,6 +538,9 @@ end)
 --   Every ~60s - full buff sync + upkeep.
 windower.register_event('prerender', function()
     if not settings then return end
+
+    -- Decrement post-cast cooldown (gates songs/debuffs, not healing).
+    if cast_cooldown > 0 then cast_cooldown = cast_cooldown - 1 end
 
     -- Movement detection: compare position each frame; trigger upkeep the moment we stop.
     local me = windower.ffxi.get_mob_by_target('me')
