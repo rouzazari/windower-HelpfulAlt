@@ -98,8 +98,8 @@ local MIN_RECAST_WAIT = 10
 local STILL_THRESHOLD = 15
 
 -- Frames after a cast completes before songs/debuffs can be cast again.
--- Covers the client-side animation lock that persists after the category 4 packet.
-local CAST_COOLDOWN_FRAMES = 150  -- ~2.5s at 60fps
+-- Covers the brief server-side lock that persists just after the category 4 packet.
+local CAST_COOLDOWN_FRAMES = 90  -- ~1.5s at 60fps
 
 -- ---------------------------------------------------------
 -- Helpers
@@ -540,7 +540,13 @@ windower.register_event('prerender', function()
     if not settings then return end
 
     -- Decrement post-cast cooldown (gates songs/debuffs, not healing).
-    if cast_cooldown > 0 then cast_cooldown = cast_cooldown - 1 end
+    -- Fire upkeep immediately the moment it clears so we don't wait for poll_tick.
+    if cast_cooldown > 0 then
+        cast_cooldown = cast_cooldown - 1
+        if cast_cooldown == 0 and not casting then
+            upkeep()
+        end
+    end
 
     -- Movement detection: compare position each frame; trigger upkeep the moment we stop.
     local me = windower.ffxi.get_mob_by_target('me')
