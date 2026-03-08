@@ -3,6 +3,8 @@
     Milestone 4: Debuff removal. Tracks party member buffs via 0x076 packets
     and casts -na spells in priority order. Integrates with the shared casting
     lock used by healing and song upkeep.
+    Milestone 4.1: Follow. Keeps Alt within a configurable yalm radius of a
+    named character, cancelling follow via setkey when close enough.
 
     Commands:
         //ha on                     - enable all automation (songs)
@@ -14,10 +16,13 @@
         //ha threshold <1-99>       - set HP% threshold for curing
         //ha cure <spell name>      - set which cure spell to use
         //ha debuff on|off          - toggle debuff removal independently
+        //ha follow <name>          - follow a named character
+        //ha follow off             - disable following
+        //ha followdist <yalms>     - set follow stop distance (default: 10)
 ]]
 
 _addon.name     = 'HelpfulAlt'
-_addon.version  = '4.0.0'
+_addon.version  = '4.1.0'
 _addon.author   = 'User'
 _addon.commands = {'helpfulalt', 'ha'}
 
@@ -40,7 +45,11 @@ local defaults = {
     heal_threshold = 80,
     cure_spell     = 'Cure IV',
     -- Debuff removal
-    debuff_enabled = true,
+    debuff_enabled  = true,
+    -- Follow
+    follow_enabled  = false,
+    follow_target   = '',
+    follow_distance = 10,
 }
 
 -- Debuff English name (lowercase) -> removal spell.
@@ -81,6 +90,8 @@ local last_pos_x      = nil    -- last known x coordinate (movement detection)
 local last_pos_z      = nil    -- last known z coordinate (movement detection)
 local still_frames    = 0      -- frames since position last changed
 local cast_cooldown   = 0      -- frames remaining in post-cast lock (songs/debuffs only)
+local follow_tick     = 0      -- prerender counter for follow distance check (~2s)
+local is_following    = false  -- true while /follow has been issued and not yet cancelled
 
 -- Player status constants
 local STATUS_IDLE     = 0
@@ -100,6 +111,10 @@ local STILL_THRESHOLD = 15
 -- Frames after a cast completes before songs/debuffs can be cast again.
 -- Covers the brief server-side lock that persists just after the category 4 packet.
 local CAST_COOLDOWN_FRAMES = 90  -- ~1.5s at 60fps
+
+-- Yalm distance at which /follow is cancelled once the alt has followed in close.
+-- Must be well below follow_distance to prevent oscillation (cancel-then-immediately-follow).
+local FOLLOW_CANCEL_YALMS = 3  -- approx melee range
 
 -- ---------------------------------------------------------
 -- Helpers
@@ -125,6 +140,7 @@ local function coerce_settings()
     settings.song_count     = tonumber(settings.song_count)     or defaults.song_count
     settings.song_duration  = tonumber(settings.song_duration)  or defaults.song_duration
     settings.heal_threshold = tonumber(settings.heal_threshold) or defaults.heal_threshold
+    settings.follow_distance = tonumber(settings.follow_distance) or defaults.follow_distance
 end
 
 -- ---------------------------------------------------------
@@ -354,6 +370,37 @@ local function upkeep_songs()
     end
 end
 
+-- ---------------------------------------------------------
+-- Follow logic
+-- ---------------------------------------------------------
+
+-- Issue /follow when beyond the distance threshold; cancel with a directional
+-- key-press once within range so the character stops moving.
+local function upkeep_follow()
+    if not settings or not settings.follow_enabled then return end
+    if not settings.follow_target or settings.follow_target == '' then return end
+    local s = player_status()
+    if s == STATUS_DEAD or s == STATUS_ZONING then return end
+    local target = windower.ffxi.get_mob_by_name(settings.follow_target)
+    if not target then return end
+    -- mob.distance is squared yalms; compare against threshold^2.
+    local threshold_sq = settings.follow_distance * settings.follow_distance
+    local cancel_sq    = FOLLOW_CANCEL_YALMS * FOLLOW_CANCEL_YALMS
+    if target.distance > threshold_sq then
+        windower.chat.input('/follow ' .. settings.follow_target)
+        is_following = true
+    elseif is_following and target.distance < cancel_sq then
+        -- Cancel /follow by briefly pressing a directional key.
+        -- Only fires when at melee range, not as soon as the follow threshold is crossed.
+        coroutine.wrap(function()
+            windower.send_command('setkey numpad2 down')
+            coroutine.sleep(0.25)
+            windower.send_command('setkey numpad2 up')
+        end)()
+        is_following = false
+    end
+end
+
 -- Unified upkeep: healing > debuff removal > song maintenance.
 local function upkeep()
     upkeep_heal()
@@ -515,6 +562,7 @@ windower.register_event('zone change', function()
     last_pos_x    = nil
     last_pos_z    = nil
     still_frames  = 0
+    is_following  = false
 end)
 
 windower.register_event('status change', function(new_status)
@@ -523,6 +571,7 @@ windower.register_event('status change', function(new_status)
         active_songs  = {}
         casting       = false
         party_debuffs = {}
+        is_following  = false
     elseif new_status == STATUS_IDLE or new_status == STATUS_ENGAGED then
         coroutine.wrap(function()
             coroutine.sleep(1)
@@ -570,6 +619,13 @@ windower.register_event('prerender', function()
     if heal_tick >= 60 then
         heal_tick = 0
         upkeep_heal()
+    end
+
+    -- Follow check: ~2s regardless of enabled flag (follow_enabled controls it internally).
+    follow_tick = follow_tick + 1
+    if follow_tick >= 120 then
+        follow_tick = 0
+        upkeep_follow()
     end
 
     if not settings.enabled then return end
@@ -685,6 +741,15 @@ windower.register_event('addon command', function(cmd, ...)
             tostring(settings.debuff_enabled),
             #debuff_priority
         ))
+        if settings.follow_enabled then
+            log(('Follow: ON   Target: %s   Stop at: %d yalms   Active: %s'):format(
+                settings.follow_target ~= '' and settings.follow_target or '(none)',
+                settings.follow_distance,
+                tostring(is_following)
+            ))
+        else
+            log('Follow: OFF')
+        end
         for i = 1, settings.song_count do
             local name               = slot_name(i) or '(none)'
             local spell_id, buff_id  = get_spell_data(name)
@@ -746,10 +811,41 @@ windower.register_event('addon command', function(cmd, ...)
         log(('Slot %d set to: %s'):format(slot, name))
         upkeep()
 
+    -- follow <name> / follow off
+    elseif cmd == 'follow' then
+        local sub = args[1] and args[1]:lower()
+        if sub == 'off' then
+            settings.follow_enabled = false
+            settings.follow_target  = ''
+            is_following = false
+            settings:save('all')
+            log('Follow disabled.')
+        elseif sub and sub ~= '' then
+            local name = table.concat(args, ' ', 1)
+            settings.follow_target  = name
+            settings.follow_enabled = true
+            settings:save('all')
+            log(('Following: %s (stop within %d yalms)'):format(name, settings.follow_distance))
+        else
+            log('Usage: //ha follow <name>  or  //ha follow off')
+        end
+
+    -- followdist <yalms>
+    elseif cmd == 'followdist' then
+        local dist = tonumber(args[1])
+        if not dist or dist < 1 then
+            log('Usage: //ha followdist <yalms>')
+            return
+        end
+        settings.follow_distance = dist
+        settings:save('all')
+        log(('Follow stop distance set to %d yalms.'):format(dist))
+
     -- help / fallthrough
     else
         log('Commands:  on | off | status | recast | song <1|2> <name>')
         log('           heal on|off | threshold <1-99> | cure <spell name>')
         log('           debuff on|off')
+        log('           follow <name> | follow off | followdist <yalms>')
     end
 end)

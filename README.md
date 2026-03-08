@@ -2,7 +2,7 @@
 
 > A Windower 4 addon that autonomously controls a secondary FFXI account playing a healer or support role. Designed to keep your alt running hands-free while you focus on your main character.
 
-**Version:** 4.0.0
+**Version:** 4.1.0
 **Command:** `//ha` or `//helpfulalt`
 
 ---
@@ -84,6 +84,14 @@ Check current state:
 | `//ha debuff on` | Enable debuff removal |
 | `//ha debuff off` | Disable debuff removal |
 
+### Follow
+
+| Command | Description |
+|---|---|
+| `//ha follow <name>` | Start following a named character, stopping within 10 yalms |
+| `//ha follow off` | Disable following |
+| `//ha followdist <yalms>` | Set the distance at which to stop following (default: 10) |
+
 ### Examples
 
     //ha song 1 Blade Madrigal
@@ -94,6 +102,9 @@ Check current state:
     //ha threshold 75
     //ha cure Cure V
     //ha debuff off
+    //ha follow Yourname
+    //ha followdist 8
+    //ha follow off
 
 Song and spell names are case-sensitive and must match the in-game spell name exactly.
 
@@ -127,6 +138,14 @@ Settings are saved automatically to `data/settings.xml` on first load. You can e
 |---|---|---|
 | `debuff_enabled` | `true` | Whether debuff removal is active on load |
 
+### Follow settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `follow_enabled` | `false` | Whether following is active on load |
+| `follow_target` | `` | Name of the character to follow |
+| `follow_distance` | `10` | Yalm radius at which to stop following |
+
 ---
 
 ## How It Works
@@ -158,9 +177,15 @@ Only one spell is ever in flight at a time. After each spell completes, an incom
 
 The addon listens for action packet category 8 with param `28787` (cast interrupted). When detected, the `casting` lock is cleared and a retry is scheduled after 10 seconds, avoiding the "Unable to cast spells at this time" lockout. A `last_cast` timestamp also enforces a minimum 10-second window before any retry.
 
+### Follow
+
+Every ~2 seconds the addon checks the distance to the follow target using `get_mob_by_name()`. If the target is beyond `follow_distance` yalms, `/follow <name>` is issued and re-issued every 2 seconds until the character is within range. Once within range, a `setkey numpad2` press is injected to cancel the follow command and stop the character. The follow check runs independently of `settings.enabled`; only `follow_enabled` controls it.
+
+While the character is moving (following), the movement detection block keeps `still_frames` at zero, which blocks spell casting. Casting automatically resumes once the character stops.
+
 ### Safety checks
 
-The addon will not cast while the player is dead or zoning. It resumes automatically when returning to an idle or engaged state.
+The addon will not cast while the player is dead or zoning. It resumes automatically when returning to an idle or engaged state. Follow is also suppressed while dead or zoning.
 
 ---
 
@@ -175,8 +200,11 @@ Cast sequencing driven by incoming action packets instead of a timed delay. Inte
 ### ✅ Milestone 3 — Party Healing
 Monitor party HP% and cure members below a configurable threshold. Healing takes priority over song upkeep. Configurable cure spell and HP threshold.
 
-### ✅ Milestone 4 — Debuff Removal *(current)*
+### ✅ Milestone 4 — Debuff Removal
 Track party member debuffs via 0x076 packets. Priority-ordered removal (Doom > Curse > Petrify > Paralysis > Plague > Silence > Blindness > Poison > Disease). Job-aware via `get_spells()`. Debuff removal runs between healing and song upkeep in the shared casting lock.
+
+### ✅ Milestone 4.1 — Follow *(current)*
+Keep Alt within a configurable yalm radius of a named character. Issues `/follow` every ~2s when beyond threshold; cancels via `setkey numpad2` when within range. Movement detection automatically suspends casting while following.
 
 ### Milestone 5 — 3 and 4 Song Support
 - Expand `song_count` to support up to 4 slots (`song3`, `song4` config keys)
@@ -194,6 +222,15 @@ Track party member debuffs via 0x076 packets. Priority-ordered removal (Doom > C
 ---
 
 ## Change Log
+
+### 4.1.0
+- Added: Follow feature - keeps Alt within a configurable yalm radius of a named character
+- Added: `//ha follow <name>`, `//ha follow off`, `//ha followdist <yalms>` commands
+- Added: `follow_enabled`, `follow_target`, `follow_distance` settings
+- Added: `setkey numpad2` used to cancel `/follow` once within stop distance
+- Added: Follow suppressed while dead or zoning; `is_following` flag reset on zone change
+- Updated: `//ha status` shows follow state (enabled, target, distance, active flag)
+- Updated: Movement detection naturally suppresses casting while the character is following
 
 ### 4.0.0
 - Added: Debuff removal — tracks party member debuffs via 0x076 packet and casts -na spells in priority order (Doom > Curse > Petrification > Paralysis > Plague > Silence > Blindness > Poison > Disease)
