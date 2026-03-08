@@ -112,10 +112,6 @@ local STILL_THRESHOLD = 15
 -- Covers the brief server-side lock that persists just after the category 4 packet.
 local CAST_COOLDOWN_FRAMES = 90  -- ~1.5s at 60fps
 
--- Yalm distance at which /follow is cancelled once the alt has followed in close.
--- Must be well below follow_distance to prevent oscillation (cancel-then-immediately-follow).
-local FOLLOW_CANCEL_YALMS = 3  -- approx melee range
-
 -- ---------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------
@@ -374,8 +370,10 @@ end
 -- Follow logic
 -- ---------------------------------------------------------
 
--- Issue /follow when beyond the distance threshold; cancel with a directional
--- key-press once within range so the character stops moving.
+-- Issue /follow when beyond the distance threshold. Stop re-issuing it once within
+-- range; FFXI's active /follow keeps the alt near the target, and the movement
+-- detection prevents casting while moving. When both characters are still, the alt
+-- resumes casting normally.
 local function upkeep_follow()
     if not settings or not settings.follow_enabled then return end
     if not settings.follow_target or settings.follow_target == '' then return end
@@ -385,18 +383,10 @@ local function upkeep_follow()
     if not target then return end
     -- mob.distance is squared yalms; compare against threshold^2.
     local threshold_sq = settings.follow_distance * settings.follow_distance
-    local cancel_sq    = FOLLOW_CANCEL_YALMS * FOLLOW_CANCEL_YALMS
     if target.distance > threshold_sq then
         windower.chat.input('/follow ' .. settings.follow_target)
         is_following = true
-    elseif is_following and target.distance < cancel_sq then
-        -- Cancel /follow by briefly pressing a directional key.
-        -- Only fires when at melee range, not as soon as the follow threshold is crossed.
-        coroutine.wrap(function()
-            windower.send_command('setkey numpad2 down')
-            coroutine.sleep(0.25)
-            windower.send_command('setkey numpad2 up')
-        end)()
+    else
         is_following = false
     end
 end

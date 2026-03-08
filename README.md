@@ -179,9 +179,9 @@ The addon listens for action packet category 8 with param `28787` (cast interrup
 
 ### Follow
 
-Every ~2 seconds the addon checks the distance to the follow target using `get_mob_by_name()`. If the target is beyond `follow_distance` yalms, `/follow <name>` is issued and re-issued every 2 seconds until the character is within range. Once within range, a `setkey numpad2` press is injected to cancel the follow command and stop the character. The follow check runs independently of `settings.enabled`; only `follow_enabled` controls it.
+Every ~2 seconds the addon checks the distance to the follow target using `get_mob_by_name()`. If the target is beyond `follow_distance` yalms, `/follow <name>` is issued. Once within range, the addon stops re-issuing `/follow`; FFXI's active follow keeps the alt near the target automatically. The follow check runs independently of `settings.enabled`; only `follow_enabled` controls it.
 
-While the character is moving (following), the movement detection block keeps `still_frames` at zero, which blocks spell casting. Casting automatically resumes once the character stops.
+While the character is moving (following), the movement detection block keeps `still_frames` at zero, which blocks spell casting. When both characters are stationary, `still_frames` builds back up and casting resumes normally.
 
 ### Safety checks
 
